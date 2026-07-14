@@ -28,7 +28,7 @@ namespace GalaxyGourd.Visioncast
         public static void Setup()
         {
             OnSourceComponentsModified = null;
-            _visioncaster = new Visioncaster(RaycastManager.ScheduledRaycaster);
+            _visioncaster = new Visioncaster(RaycastManager.ScheduledRaycaster, VisionBroadphase.Factory());
             
             //
             foreach (VisioncastSource source in _addQueue)
@@ -56,6 +56,12 @@ namespace GalaxyGourd.Visioncast
             _visioncaster?.Tick(delta);
             PostVisioncastTick?.Invoke();
         }
+
+        /// <summary>
+        /// Accumulated vision-time (sum of tick deltas, driver-relative — not Unity Time.time). Compare
+        /// against a source's <see cref="VisioncastSource.LastUpdatedTime"/> to gauge result staleness.
+        /// </summary>
+        public static float VisionTime => _visioncaster?.VisionTime ?? 0f;
 
         /// <summary>
         /// Updates the debug visualization for the visioncast sources

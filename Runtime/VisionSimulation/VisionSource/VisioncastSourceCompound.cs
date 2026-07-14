@@ -115,10 +115,11 @@ namespace GalaxyGourd.Visioncast
                 if (!source || !source.isActiveAndEnabled)
                     continue;
 
+                float updateTime = source.LastUpdatedTime;
                 IReadOnlyList<DataVisionSeenObject> targets = source.VisionTargets;
                 for (int t = 0; t < targets.Count; t++)
                 {
-                    MergeTarget(targets[t]);
+                    MergeTarget(targets[t], updateTime);
                 }
             }
 
@@ -133,7 +134,7 @@ namespace GalaxyGourd.Visioncast
             ResolveTransitions();
         }
 
-        private void MergeTarget(DataVisionSeenObject incoming)
+        private void MergeTarget(DataVisionSeenObject incoming, float updateTime)
         {
             Collider col = incoming.ResultObject;
             if (col == null)
@@ -149,6 +150,7 @@ namespace GalaxyGourd.Visioncast
                 entry.Angle = Mathf.Min(entry.Angle, incoming.Angle);
                 entry.VisiblePointCount += incoming.VisiblePointCount;
                 entry.SampleCount += incoming.SampleCount;
+                entry.LastUpdatedTime = Mathf.Max(entry.LastUpdatedTime, updateTime);
 
                 // The representative collider is the most-visible contribution
                 if (incoming.Visibility > _maxVis[i])
@@ -174,7 +176,8 @@ namespace GalaxyGourd.Visioncast
                     Angle = incoming.Angle,
                     VisiblePointCount = incoming.VisiblePointCount,
                     SampleCount = incoming.SampleCount,
-                    Visibility = 0f // resolved in the finalize pass
+                    Visibility = 0f, // resolved in the finalize pass
+                    LastUpdatedTime = updateTime
                 });
                 _maxVis.Add(incoming.Visibility);
                 _sumVis.Add(incoming.Visibility);

@@ -30,5 +30,11 @@ namespace GalaxyGourd.Visioncast
         public int SampleCount;
         /// <summary>Aggregated visibility in [0, 1] (see <see cref="VisibilityAggregation"/>).</summary>
         public float Visibility;
+        /// <summary>
+        /// Vision-time of the most recent contributing source update (see
+        /// <see cref="VisioncastManager.VisionTime"/>). Children update on different cadences under LOD,
+        /// so this is the freshest observation folded into the target.
+        /// </summary>
+        public float LastUpdatedTime;
     }
 }

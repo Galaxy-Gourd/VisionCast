@@ -29,17 +29,10 @@ namespace GalaxyGourd.Visioncast
         // We use this to map our raycast requests back to the correct source/target/point
         private readonly List<RaycastRequestMap> _raycastRequestMap = new();
 
-        // Results are DOUBLE-buffered: each source's LastResults hands these lists to external
-        // consumers (gameplay, debug visualization in LateUpdate), so the generation just handed
-        // out must stay intact until the next distribution. We ping-pong between two generations
-        // and only ever recycle the one no consumer is still holding.
-        private readonly List<DataVisioncastResult>[] _resultGenerations =
-        {
-            new List<DataVisioncastResult>(),
-            new List<DataVisioncastResult>()
-        };
-        private int _activeGeneration;
-        private List<DataVisioncastResult> ActiveResults => _resultGenerations[_activeGeneration];
+        // Results are owned PER-SOURCE (see VisioncastSource._resultBuffers), double-buffered there so
+        // a source's LastResults stays valid until that source's own next distribution - independent of
+        // any other source's update cadence. The Visioncaster writes into each source's back buffer and
+        // returns that buffer's pooled point-lists here on reset.
 
         // Reused Vector3 lists to keep the narrowphase off the per-frame allocation path
         private readonly Stack<List<Vector3>> _pointListPool = new();
@@ -48,9 +41,10 @@ namespace GalaxyGourd.Visioncast
         // List.IndexOf per sample point. Grown to component count and cleared each distribution.
         private readonly List<Dictionary<Collider, int>> _resultObjectIndex = new();
 
-        // Single shared broadphase hit buffer - sources are processed sequentially on the main
-        // thread, so one buffer serves all of them (no per-source array needed).
-        private readonly Collider[] _broadphaseHits = new Collider[CONST_VisionCastColliderBuffer];
+        // Broadphase (spatial query) behind a swappable seam; candidates[i] holds the in-range colliders
+        // for scheduled source i, reused each tick. The Visioncaster owns and disposes the broadphase.
+        private readonly IBroadphase _broadphase;
+        private readonly List<List<Collider>> _broadphaseCandidates = new();
         private readonly SystemScheduledRaycaster _raycaster;
         private bool _waitingForRaycasts;
         private bool _destroyed;
@@ -58,7 +52,19 @@ namespace GalaxyGourd.Visioncast
         private readonly List<VisioncastSource> _queuedAdd = new();
         private readonly List<VisioncastSource> _queuedRemove = new();
 
-        private const int CONST_VisionCastColliderBuffer = 64;
+        // The subset of sources casting THIS tick, chosen by relevance-driven cadence (BuildSchedule).
+        // All per-tick buffers/indices are aligned 1:1 with this list, not _components. It holds source
+        // references (not indices), so it stays valid across registration changes between schedule and
+        // the following tick's distribution.
+        private readonly List<VisioncastSource> _scheduled = new();
+        private long _scheduleTick;
+
+        // Accumulated vision-time (sum of tick deltas), used to stamp each source's LastUpdatedTime so
+        // consumers can gauge staleness under LOD/time-slicing. Driver-relative (not Unity Time.time),
+        // to keep the system decoupled from the update loop.
+        private float _visionTime;
+        internal float VisionTime => _visionTime;
+
         private const int CONST_PointListCapacity = 7;
 
         #endregion VARIABLES
@@ -66,9 +72,10 @@ namespace GalaxyGourd.Visioncast
 
         #region INITIALIZATION
 
-        internal Visioncaster(SystemScheduledRaycaster raycaster)
+        internal Visioncaster(SystemScheduledRaycaster raycaster, IBroadphase broadphase)
         {
             _raycaster = raycaster;
+            _broadphase = broadphase;
             RaycasterRequests = new List<DataScheduledRaycastRequest>();
         }
 
@@ -103,6 +110,8 @@ namespace GalaxyGourd.Visioncast
                     continue;
 
                 _components.Add(source);
+                // Stable per-source phase offset spreads same-cadence sources across ticks
+                source.SchedulePhase = source.GetInstanceID() & int.MaxValue;
             }
 
             foreach (VisioncastSource source in _queuedRemove)
@@ -129,15 +138,48 @@ namespace GalaxyGourd.Visioncast
 
         internal void Tick(float delta)
         {
+            // Advance vision-time every cycle (even skipped ones) so staleness reflects real elapsed time
+            _visionTime += delta;
+
             if (_destroyed || _waitingForRaycasts)
                 return;
 
+            BuildSchedule();
             CalculateVisionBroadphase();
             ExecuteVisionNarrowphase();
 
             // Guard against scheduling again before the previous batch has been received
             _waitingForRaycasts = true;
             _raycaster.Schedule(this, RaycasterRequests);
+        }
+
+        /// <summary>
+        /// Chooses the subset of sources to cast this tick from their relevance-driven cadence. Sources
+        /// with null transforms and dormant (out-of-range) sources are excluded; the rest cast on the
+        /// ticks matching their tier cadence, phase-spread so same-cadence sources don't all fire together.
+        /// </summary>
+        private void BuildSchedule()
+        {
+            _scheduled.Clear();
+            _scheduleTick++;
+
+            for (int i = 0; i < _components.Count; i++)
+            {
+                VisioncastSource source = _components[i];
+                if (source.transform == null)
+                    continue;
+
+                float distance = VisionRelevance.GetDistance(source);
+                int tier = VisionLOD.ResolveTier(distance, source.ScheduleTier);
+                source.ScheduleTier = tier;
+
+                int cadence = VisionLOD.CadenceForTier(tier);
+                if (cadence <= 0)
+                    continue; // dormant
+
+                if (cadence == 1 || (_scheduleTick + source.SchedulePhase) % cadence == 0)
+                    _scheduled.Add(source);
+            }
         }
 
         #endregion TICK
@@ -150,45 +192,39 @@ namespace GalaxyGourd.Visioncast
         /// </summary>
         private void CalculateVisionBroadphase()
         {
-            // Reset the intermediate buffers for the new calculation; slots are reused, not reallocated
-            PrepareBuffers(_components.Count);
+            // Reset the intermediate buffers for the new calculation; slots are reused, not reallocated.
+            // Buffers are aligned 1:1 with the scheduled subset, not the full component list.
+            PrepareBuffers(_scheduled.Count);
+            PrepareBroadphaseCandidates(_scheduled.Count);
 
-            for (int i = 0; i < _components.Count; i++)
+            // Let sources update their vision params before the (possibly batched) spatial query reads them
+            for (int i = 0; i < _scheduled.Count; i++)
+                _scheduled[i].OnBeforeVisioncast();
+
+            // Spatial query stage (swappable): fill candidates[i] with the in-range colliders per source
+            _broadphase.Query(_scheduled, _scheduled.Count, _broadphaseCandidates);
+
+            // Narrow the candidates by manifest membership + field-of-view angle, and generate samples
+            for (int i = 0; i < _scheduled.Count; i++)
             {
-                VisioncastSource source = _components[i];
-
-                // Skipping a source must NOT skip its slot - PrepareBuffers already added an empty
-                // one at index i, so alignment with _components is preserved
-                if (source.transform == null)
+                List<Collider> candidates = _broadphaseCandidates[i];
+                if (candidates.Count == 0)
                     continue;
 
-                source.OnBeforeVisioncast();
-
+                VisioncastSource source = _scheduled[i];
                 Vector3 position = source.Position;
-                int hitCount = Physics.OverlapSphereNonAlloc(
-                    position,
-                    source.Range,
-                    _broadphaseHits,
-                    source.BroadphaseLayers,
-                    QueryTriggerInteraction.UseGlobal);
-
-                // A saturated buffer silently drops targets - surface it rather than hide it
-                if (hitCount >= _broadphaseHits.Length)
-                {
-                    Debug.LogWarning($"Visioncast broadphase buffer ({CONST_VisionCastColliderBuffer}) saturated " +
-                                     $"for '{source.name}'; some targets may be ignored this tick.");
-                }
-
-                if (hitCount == 0)
-                    continue;
-
                 Vector3 heading = source.Heading;
                 float fov = source.FieldOfView;
                 VisionSampleMode sampleMode = source.SampleMode;
-                int sampleResolution = source.SampleResolution;
-                for (int h = 0; h < hitCount; h++)
+                // Far tiers may cap sampling coarser than the source requests (never finer)
+                int tierResolution = VisionLOD.SampleResolutionForTier(source.ScheduleTier);
+                int sampleResolution = tierResolution > 0
+                    ? Mathf.Min(source.SampleResolution, tierResolution)
+                    : source.SampleResolution;
+
+                for (int h = 0; h < candidates.Count; h++)
                 {
-                    Collider hit = _broadphaseHits[h];
+                    Collider hit = candidates[h];
                     if (!hit)
                         continue;
 
@@ -225,24 +261,10 @@ namespace GalaxyGourd.Visioncast
             RaycasterRequests.Clear();
             _raycastRequestMap.Clear();
 
-            // One straight-ahead cast per source, kept 1:1 with _components
-            for (int i = 0; i < _components.Count; i++)
+            // One straight-ahead cast per scheduled source, kept 1:1 with _scheduled
+            for (int i = 0; i < _scheduled.Count; i++)
             {
-                VisioncastSource source = _components[i];
-                if (source.transform == null)
-                {
-                    // Placeholder keeps the request list aligned with _components; a zero-layer
-                    // cast is a guaranteed miss and its slot is ignored on distribution
-                    RaycasterRequests.Add(new DataScheduledRaycastRequest
-                    {
-                        SourcePosition = Vector3.zero,
-                        Direction = Vector3.forward,
-                        MaxDistance = 0,
-                        LayerMask = 0
-                    });
-                    continue;
-                }
-
+                VisioncastSource source = _scheduled[i];
                 RaycasterRequests.Add(new DataScheduledRaycastRequest
                 {
                     SourcePosition = source.Position,
@@ -253,12 +275,9 @@ namespace GalaxyGourd.Visioncast
             }
 
             // One cast per visible sample point, mapped back to its source/object/point
-            for (int i = 0; i < _components.Count; i++)
+            for (int i = 0; i < _scheduled.Count; i++)
             {
-                VisioncastSource source = _components[i];
-                if (source.transform == null)
-                    continue;
-
+                VisioncastSource source = _scheduled[i];
                 Vector3 position = source.Position;
                 float range = source.Range;
                 int layerMask = source.RaycastLayers;
@@ -291,10 +310,10 @@ namespace GalaxyGourd.Visioncast
 
         void IScheduledRaycastListener.ReceiveScheduledRaycasterResults()
         {
-            // Requests are 1:1 with (straight-ahead per source) + (mapped sample points). With
-            // uniform queued registration the component set no longer changes mid-flight, so this
-            // is a defensive guard rather than an expected path.
-            if (RaycasterResults.Count == _raycastRequestMap.Count + _components.Count)
+            // Requests are 1:1 with (straight-ahead per scheduled source) + (mapped sample points).
+            // _scheduled still holds the batch's source set (rebuilt only in the next tick's
+            // BuildSchedule, which runs after this distribution), so this is a defensive guard.
+            if (RaycasterResults.Count == _raycastRequestMap.Count + _scheduled.Count)
             {
                 DistributeRaycasterResults();
             }
@@ -310,11 +329,12 @@ namespace GalaxyGourd.Visioncast
 
         private void DistributeRaycasterResults()
         {
-            // Flip to the generation no consumer is still holding and prepare it fresh. The
-            // previous generation stays intact behind each source's LastResults.
-            _activeGeneration ^= 1;
-            PrepareResultGeneration(_activeGeneration, _components.Count);
-            PrepareResultObjectIndex(_components.Count);
+            // Reset each scheduled source's back result buffer (recycles its pooled point-lists) before
+            // writing. Per-source ownership: the buffer reset here is the one NOT behind LastResults, so
+            // nothing a consumer is still holding gets recycled - and unscheduled sources keep theirs.
+            for (int i = 0; i < _scheduled.Count; i++)
+                ResetSourceResultBuffer(_scheduled[i]);
+            PrepareResultObjectIndex(_scheduled.Count);
 
             // Distribute straight-ahead raycasts
             DistributeStraightAheadCasts();
@@ -339,13 +359,12 @@ namespace GalaxyGourd.Visioncast
 
         private void DistributeStraightAheadCasts()
         {
-            List<DataVisioncastResult> results = ActiveResults;
-            for (int i = 0; i < _components.Count; i++)
+            for (int i = 0; i < _scheduled.Count; i++)
             {
                 RaycastHit hit = RaycasterResults[i];
                 if (hit.collider != null && VisionTargetsManifest.Manifest.Contains(hit.collider))
                 {
-                    DataVisioncastResult result = results[i];
+                    DataVisioncastResult result = _scheduled[i].ResultBackBuffer;
 
                     // Denominator is the object's dedicated sample count; the straight-ahead ray is
                     // an extra confirmed point on top of it (visibility is clamped on read)
@@ -368,12 +387,11 @@ namespace GalaxyGourd.Visioncast
 
         private void DistributeMappedCasts()
         {
-            List<DataVisioncastResult> results = ActiveResults;
-            for (int i = _components.Count; i < RaycasterResults.Count; i++)
+            for (int i = _scheduled.Count; i < RaycasterResults.Count; i++)
             {
                 RaycastHit hit = RaycasterResults[i];
-                RaycastRequestMap map = _raycastRequestMap[i - _components.Count];
-                DataVisioncastResult result = results[map.Source];
+                RaycastRequestMap map = _raycastRequestMap[i - _scheduled.Count];
+                DataVisioncastResult result = _scheduled[map.Source].ResultBackBuffer;
                 Dictionary<Collider, int> objectIndexMap = _resultObjectIndex[map.Source];
                 Collider thisObject = _visibleObjects[map.Source][map.Object];
                 Vector3 thisPoint = _visibleObjectPoints[map.Source][map.Object][map.Point];
@@ -400,10 +418,14 @@ namespace GalaxyGourd.Visioncast
 
         private void SendResultsToComponents()
         {
-            List<DataVisioncastResult> results = ActiveResults;
-            for (int i = 0; i < _components.Count; i++)
+            for (int i = 0; i < _scheduled.Count; i++)
             {
-                _components[i].ReceiveResults(results[i]);
+                VisioncastSource source = _scheduled[i];
+
+                // A source destroyed between schedule and distribution: its buffer writes were harmless
+                // (managed access), but skip delivery so OnReceiveResults never touches a dead transform
+                if (source.transform != null)
+                    source.DeliverResults(_visionTime);
             }
         }
 
@@ -446,6 +468,19 @@ namespace GalaxyGourd.Visioncast
         }
 
         /// <summary>
+        /// Grows and clears the per-source broadphase candidate lists for a query over
+        /// <paramref name="count"/> scheduled sources. Reused each tick (capacity retained).
+        /// </summary>
+        private void PrepareBroadphaseCandidates(int count)
+        {
+            while (_broadphaseCandidates.Count < count)
+                _broadphaseCandidates.Add(new List<Collider>());
+
+            for (int i = 0; i < count; i++)
+                _broadphaseCandidates[i].Clear();
+        }
+
+        /// <summary>
         /// Grows and clears the per-source result-object index maps for a distribution over
         /// <paramref name="count"/> sources. Reused each tick so distribution allocates no maps.
         /// </summary>
@@ -459,45 +494,22 @@ namespace GalaxyGourd.Visioncast
         }
 
         /// <summary>
-        /// Recycles the given result generation and sizes it to <paramref name="count"/> sources.
-        /// Only ever called on the generation no consumer is holding (see DistributeRaycasterResults).
+        /// Recycles a source's back result buffer before it is rewritten this distribution. Returns its
+        /// point-lists to the shared pool; the buffer is the one NOT behind LastResults, so nothing a
+        /// consumer still holds is recycled.
         /// </summary>
-        private void PrepareResultGeneration(int generation, int count)
+        private void ResetSourceResultBuffer(VisioncastSource source)
         {
-            List<DataVisioncastResult> results = _resultGenerations[generation];
+            DataVisioncastResult buffer = source.ResultBackBuffer;
 
-            // Return this generation's point-lists to the pool before reuse
-            for (int i = 0; i < results.Count; i++)
-            {
-                List<List<Vector3>> visiblePoints = results[i].VisiblePoints;
-                for (int e = 0; e < visiblePoints.Count; e++)
-                    ReturnPointList(visiblePoints[e]);
-                visiblePoints.Clear();
-            }
+            for (int e = 0; e < buffer.VisiblePoints.Count; e++)
+                ReturnPointList(buffer.VisiblePoints[e]);
+            buffer.VisiblePoints.Clear();
 
-            // Grow to match the component count, reusing containers
-            while (results.Count < count)
-            {
-                results.Add(new DataVisioncastResult
-                {
-                    Objects = new List<Collider>(),
-                    VisiblePoints = new List<List<Vector3>>(),
-                    SampleCounts = new List<int>(),
-                    Distances = new List<float>(),
-                    Angles = new List<float>()
-                });
-            }
-
-            // Reset the active range; capacity is retained
-            for (int i = 0; i < count; i++)
-            {
-                DataVisioncastResult result = results[i];
-                result.Objects.Clear();
-                result.SampleCounts.Clear();
-                result.Distances.Clear();
-                result.Angles.Clear();
-                // VisiblePoints already cleared above
-            }
+            buffer.Objects.Clear();
+            buffer.SampleCounts.Clear();
+            buffer.Distances.Clear();
+            buffer.Angles.Clear();
         }
 
         private List<Vector3> RentPointList()
@@ -542,7 +554,9 @@ namespace GalaxyGourd.Visioncast
         public void Dispose()
         {
             _destroyed = true;
+            _broadphase?.Dispose();
             _components.Clear();
+            _scheduled.Clear();
             _queuedAdd.Clear();
             _queuedRemove.Clear();
         }
