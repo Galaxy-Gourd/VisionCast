@@ -17,6 +17,25 @@ namespace GalaxyGourd.Visioncast
         public override LayerMask RaycastLayers => _dataInteraction.RaycastLayermask;
         public override float Range => _dataInteraction.VisionRange;
         public override float FieldOfView => _dataInteraction.FieldOfView;
+        public override VisionSampleMode SampleMode => _dataInteraction.SampleMode;
+        public override int SampleResolution => _dataInteraction.SampleResolution;
+
+        /// <summary>
+        /// All objects currently resolved by this source (visible and in-range-but-occluded)
+        /// </summary>
+        public IReadOnlyList<DataVisionSeenObject> VisionTargets => _filteredVisionTargets;
+        /// <summary>
+        /// Objects that became visible since the most recent visioncast update
+        /// </summary>
+        public IReadOnlyList<Collider> NewlySeenObjects => _newlySeenObjects;
+        /// <summary>
+        /// Objects that stopped being visible since the most recent visioncast update
+        /// </summary>
+        public IReadOnlyList<Collider> NewlyLostObjects => _newlyLostObjects;
+        /// <summary>
+        /// The object most directly in the center of this source's field of view, if any
+        /// </summary>
+        public Collider TargetedObject => _targetedObject;
 
         /// <summary>
         /// All objects currently seen by this source
@@ -36,6 +55,13 @@ namespace GalaxyGourd.Visioncast
         protected readonly List<Collider> _newlyLostObjects = new();
 
         private readonly List<DataVisionSeenObject> _objCache = new();
+
+        // Reused buffers so filtering allocates nothing per update: a second results list to
+        // ping-pong with _filteredVisionTargets, and collider->index maps / a set for O(1) diffs
+        private List<DataVisionSeenObject> _resolveBuffer = new();
+        private readonly Dictionary<Collider, int> _previousIndex = new();
+        private readonly Dictionary<Collider, int> _currentIndex = new();
+        private readonly HashSet<Collider> _newlyLostSet = new();
 
         #endregion VARIABLES
         
@@ -69,41 +95,59 @@ namespace GalaxyGourd.Visioncast
                 return;
             }
             
-            // Resolve seen objects into workable data
-            List<DataVisionSeenObject> newResults = VisioncastResultsFilter.Resolve(data, _filteredVisionTargets);
+            // Resolve seen objects into the reused buffer (previous = current _filteredVisionTargets)
+            VisioncastResultsFilter.Resolve(data, _filteredVisionTargets, _previousIndex, _resolveBuffer);
+            List<DataVisionSeenObject> newResults = _resolveBuffer;
             _newlySeenObjects.Clear();
             _newlyLostObjects.Clear();
+            _newlyLostSet.Clear();
 
-            // We need to act on the objects that were seen previously, but no more
+            // Index the new results by collider for O(1) presence checks
+            _currentIndex.Clear();
+            for (int i = 0; i < newResults.Count; i++)
+            {
+                Collider obj = newResults[i].ResultObject;
+                if (!ReferenceEquals(obj, null))
+                    _currentIndex[obj] = i;
+            }
+
+            // Objects that were visible before but are no longer present at all are newly lost
             for (int i = 0; i < _filteredVisionTargets.Count; i++)
             {
-                // If we HAD seen an item but NO LONGER have it in the results array
-                if (_filteredVisionTargets[i].IsVisible &&
-                    !VisioncastResultsFilter.DataSeenContainsObject(newResults, _filteredVisionTargets[i].ResultObject))
+                DataVisionSeenObject prev = _filteredVisionTargets[i];
+                if (!prev.IsVisible || ReferenceEquals(prev.ResultObject, null))
+                    continue;
+
+                if (!_currentIndex.ContainsKey(prev.ResultObject) && _newlyLostSet.Add(prev.ResultObject))
+                    _newlyLostObjects.Add(prev.ResultObject);
+            }
+
+            // From the new results: collect newly seen, and present-but-not-visible as newly lost
+            for (int i = 0; i < newResults.Count; i++)
+            {
+                DataVisionSeenObject visionObject = newResults[i];
+                if (visionObject.JustBecameVisible)
                 {
-                    _newlyLostObjects.Add(_filteredVisionTargets[i].ResultObject);
+                    _newlySeenObjects.Add(visionObject.ResultObject);
+                }
+                else if (!visionObject.IsVisible &&
+                         !ReferenceEquals(visionObject.ResultObject, null) &&
+                         _newlyLostSet.Add(visionObject.ResultObject))
+                {
+                    _newlyLostObjects.Add(visionObject.ResultObject);
                 }
             }
 
-            // Collect new objects
-            foreach (DataVisionSeenObject visionObject in newResults)
-            {
-                if (visionObject.JustBecameVisible)
-                    _newlySeenObjects.Add(visionObject.ResultObject);
-                else if (!visionObject.IsVisible && !_newlyLostObjects.Contains(visionObject.ResultObject))
-                    _newlyLostObjects.Add(visionObject.ResultObject);
-            }
-
+            // Swap: new results become current; the old current list is reused as next resolve buffer
+            _resolveBuffer = _filteredVisionTargets;
             _filteredVisionTargets = newResults;
-            
+
             // The object closest to the view center is our key object
             float closestAngle = float.MaxValue;
             _targetedObject = null;
-            foreach (DataVisionSeenObject obj in _filteredVisionTargets)
+            for (int i = 0; i < _filteredVisionTargets.Count; i++)
             {
-                // if (obj.IsVisible) 
-                //     obj.ResultObject.Seen(this);
-                
+                DataVisionSeenObject obj = _filteredVisionTargets[i];
                 if (obj.IsVisible && obj.Angle < closestAngle)
                 {
                     closestAngle = obj.Angle;

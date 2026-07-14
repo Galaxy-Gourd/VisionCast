@@ -11,5 +11,9 @@ namespace GalaxyGourd.Visioncast
         public LayerMask RaycastLayermask;
         public float VisionRange;
         public float FieldOfView;
+
+        [Header("Sampling")]
+        public VisionSampleMode SampleMode = VisionSampleMode.BoundsFaceGrid;
+        [Min(1)] public int SampleResolution = 1;
     }
 }

@@ -5,30 +5,32 @@ namespace GalaxyGourd.Visioncast
 {
     internal static class VisiblePointsProcessor
     {
-        #region VARIABLES
-
-        private static readonly Vector3[] _boundsCache = new Vector3[6];
-
-        #endregion VARIABLES
-
-
-        #region INITIALIZATION
-
-
-
-        #endregion INITIALIZATION
-
-
         #region PROCESS
 
-        internal static Vector3[] Process(Collider collider)
+        /// <summary>
+        /// Appends the line-of-sight sample points for a collider to <paramref name="points"/>,
+        /// using the given sampling strategy and density. Writing into a caller-owned (pooled) list
+        /// keeps the narrowphase off the per-frame allocation path.
+        /// </summary>
+        internal static void Process(Collider collider, VisionSampleMode mode, int resolution, List<Vector3> points)
         {
-            switch (collider)
+            VisioncastUtility.GetOrientedBounds(
+                collider,
+                out Vector3 center,
+                out Vector3 axisX,
+                out Vector3 axisY,
+                out Vector3 axisZ,
+                out Vector3 extents);
+
+            switch (mode)
             {
-                case BoxCollider box:
-                    return VisioncastUtility.GetBoxColliderExtentsFaces(box, 0, _boundsCache);
+                case VisionSampleMode.BoundsVolumeGrid:
+                    VisioncastUtility.AppendVolumeGrid(center, axisX, axisY, axisZ, extents, resolution, points);
+                    break;
+                case VisionSampleMode.BoundsFaceGrid:
                 default:
-                    return VisioncastUtility.GetColliderBoundsFaces(collider, 0, _boundsCache);
+                    VisioncastUtility.AppendFaceGrid(center, axisX, axisY, axisZ, extents, resolution, points);
+                    break;
             }
         }
 

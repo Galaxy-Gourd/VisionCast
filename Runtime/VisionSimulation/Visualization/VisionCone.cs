@@ -26,10 +26,10 @@ namespace GalaxyGourd.Visioncast
         // exactly Range from the apex). If false, a flat disc closes it.
         [SerializeField] private bool _sphericalCap = true;
 
-        // If your source's FieldOfView is the FULL cone angle, leave true so
-        // it's halved into a half-angle. If it's already the half-angle
-        // (axis -> rim), set this false.
-        [SerializeField] private bool _fieldOfViewIsFullAngle = true;
+        // VisioncastSource.FieldOfView is authored as a HALF-angle (axis -> rim)
+        // to match the detection test, so this defaults to false. Enable it only
+        // for a source that instead supplies the FULL cone angle.
+        [SerializeField] private bool _fieldOfViewIsFullAngle;
 
         private MeshRenderer _renderer;
         private MeshFilter _filter;
